@@ -6,8 +6,10 @@ import math
 import os
 import re
 import sys
+import tarfile
+import zipfile
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import numpy as np
 import pikepdf
@@ -16,6 +18,7 @@ import requests
 from fontTools import agl, subset
 from fontTools.pens.basePen import BasePen
 from fontTools.ttLib import TTFont, TTCollection, newTable
+from fontTools.varLib.instancer import instantiateVariableFont
 
 from .common import PDFWorkError, digest, inside, read_json, ref, write_json
 
@@ -183,6 +186,10 @@ class FontModel:
         if isinstance(mapping, pikepdf.Stream):
             self.gid_map = mapping.read_bytes()
         self.inverse = {}
+        # Some generators map their visible space glyph to U+0009. The editable
+        # representation is a single line: use an ordinary space, retaining the
+        # same source code/glyph for encoding and leaving the PDF CMap untouched.
+        self.cmap = {code: text.replace("\t", " ") for code, text in self.cmap.items()}
         for code, text in self.cmap.items():
             if not text or "\ufffd" in text:
                 continue
@@ -444,12 +451,22 @@ def outline(font, glyph, with_area=False):
     glyph_set[glyph].draw(pen)
     points = np.asarray(pen.points, dtype=float).reshape((-1, 2))
     area = 0.
+    contours = []
     limits = pen.contour_starts + [len(points)]
     for start, end in zip(limits, limits[1:]):
         contour = points[start:end]
+        # Full fonts can retain single-point contours that PDF subsets omit
+        # (e.g. DejaVu Sans 'u'). They draw no segment and must not contribute
+        # to boundary distances or the count of comparable outline glyphs.
+        # Use exact coincidence, not an area/size threshold: tiny marks and
+        # self-intersecting contours with zero signed area must still be checked.
+        if len(contour) < 2 or np.all(contour == contour[0]):
+            continue
+        contours.append(contour)
         if len(contour) > 2:
             nxt = np.roll(contour, -1, axis=0)
             area += float(np.sum(contour[:, 0]*nxt[:, 1] - nxt[:, 0]*contour[:, 1]) / 2)
+    points = np.concatenate(contours) if contours else np.empty((0, 2), dtype=float)
     return (points, abs(area)) if with_area else points
 
 
@@ -514,21 +531,22 @@ def read_font(path, index=0):
     return TTFont(path, fontNumber=index)
 
 
-def bind_font(folder, font_id, path, index=0):
+def bind_font(folder, font_id, path, index=0, *, provenance=None):
     folder = Path(folder)
     pdf, model = load_project_model(folder, font_id)
     try:
-        candidate = read_font(path, index)
-        check = verify_candidate(model, candidate)
-        if not check["accepted"]:
-            raise PDFWorkError(json.dumps(check, ensure_ascii=False))
-        candidate.flavor = None
-        stream = io.BytesIO(); candidate.save(stream)
+        with read_font(path, index) as candidate:
+            check = verify_candidate(model, candidate)
+            if not check["accepted"]:
+                raise PDFWorkError(json.dumps(check, ensure_ascii=False))
+            candidate.flavor = None
+            stream = io.BytesIO(); candidate.save(stream)
         data = stream.getvalue()
         name = f"fonts/resolved/{font_id}-{digest(data)[:16]}.otf"
         target = inside(folder, name); target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(data)
         bindings = read_json(folder / "bindings.json")
         bindings[font_id] = {"file": name, "sha256": digest(data), "source": str(Path(path).resolve()), "font_index": index, "validation": check}
+        bindings[font_id].update(provenance or {})
         write_json(folder / "bindings.json", bindings)
         return bindings[font_id]
     finally:
@@ -588,6 +606,184 @@ def download(url):
         raise PDFWorkError(f"Font download failed: {exc}") from exc
 
 
+# Official binary releases. Keep versions explicit: upstream changes must still
+# pass the embedded-outline checks, and adding a family should only need an entry.
+UPSTREAM_FONT_PACKAGES = (
+    {
+        "source": "dejavu", "families": ("dejavu",), "archive": "zip",
+        "sha256": "7576310b219e04159d35ff61dd4a4ec4cdba4f35c00e002a136f00e96a908b0a",
+        "urls": (
+            "https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.zip",
+            "https://downloads.sourceforge.net/project/dejavu/dejavu/2.37/dejavu-fonts-ttf-2.37.zip",
+        ),
+    },
+    {
+        "source": "liberation", "families": ("liberationsans", "liberationserif", "liberationmono"),
+        "archive": "tar",
+        "urls": ("https://github.com/liberationfonts/liberation-fonts/files/7261482/liberation-fonts-ttf-2.1.5.tar.gz",),
+    },
+    {
+        "source": "gnu-freefont", "families": ("freesans", "freeserif", "freemono"), "archive": "zip",
+        "urls": (
+            "https://ftp.gnu.org/gnu/freefont/freefont-ttf-20120503.zip",
+            "https://ftpmirror.gnu.org/freefont/freefont-ttf-20120503.zip",
+        ),
+    },
+)
+
+
+def font_style(model):
+    if model.tt and "OS/2" in model.tt:
+        table = model.tt["OS/2"]
+        return int(table.usWeightClass), int(bool(table.fsSelection & (1 | 512)))
+    name = normalized_name(model.name)
+    return (700 if "bold" in name else 400), int("italic" in name or "oblique" in name)
+
+
+def google_font_resources(model, family, text):
+    weight, italic = font_style(model)
+    chars = "".join(sorted(set(text + "".join(t for t in model.inverse if len(t) == 1 and t.isprintable()))))
+    selector = family if ":" in family else f"{family}:ital,wght@{italic},{weight}"
+    url = "https://fonts.googleapis.com/css2?" + urlencode({"family": selector, "text": chars})
+    response = download(url)
+    urls = list(dict.fromkeys(re.findall(r"url\(['\"]?(https://fonts\.gstatic\.com/[^)'\"\s]+)['\"]?\)", response.text)))
+    if not urls:
+        raise PDFWorkError("Google Fonts returned no font resources")
+    for url in urls:
+        yield {"url": url}
+
+
+def github_font_resources(model, family, text):
+    """The official Google Fonts repository also serves full TTF/OTF fonts."""
+    slug = re.sub(r"[^a-z0-9]", "", family.split(":", 1)[0].casefold())
+    if not slug:
+        raise PDFWorkError("No usable family name for the Google Fonts repository")
+    found = False
+    for license_dir in ("ofl", "apache", "ufl"):
+        url = f"https://api.github.com/repos/google/fonts/contents/{license_dir}/{slug}"
+        try:
+            entries = download(url).json()
+        except PDFWorkError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, requests.HTTPError) and cause.response is not None and cause.response.status_code == 404:
+                continue
+            raise
+        if not isinstance(entries, list):
+            raise PDFWorkError("Invalid Google Fonts repository directory response")
+        # Prefer the exact PostScript filename, but validate every candidate:
+        # filenames and family names alone never establish a match.
+        entries.sort(key=lambda item: normalized_name(Path(item["name"]).stem) != normalized_name(model.name))
+        for item in entries:
+            if item.get("type") == "file" and Path(item["name"]).suffix.lower() in (".ttf", ".otf"):
+                found = True
+                path = f"{license_dir}/{slug}/{quote(item['name'], safe='')}"
+                yield {"url": f"https://raw.githubusercontent.com/google/fonts/main/{path}"}
+    if not found:
+        raise PDFWorkError(f"Family {family!r} has no TTF/OTF files in the Google Fonts repository")
+
+
+def online_font_sources(model, family, text):
+    family_key = normalized_name(family.split(":", 1)[0])
+    for package in UPSTREAM_FONT_PACKAGES:
+        if family_key.startswith(package["families"]):
+            resources = [{"url": url, "archive": package["archive"], "sha256": package.get("sha256")}
+                         for url in package["urls"]]
+            yield package["source"], resources
+    yield "google-fonts", google_font_resources(model, family, text)
+    yield "google-fonts-github", github_font_resources(model, family, text)
+
+
+def font_payloads(data, resource, model):
+    """Read archive members in memory; never extract downloaded paths to disk."""
+    if resource.get("sha256") and digest(data) != resource["sha256"]:
+        raise PDFWorkError("Font archive SHA-256 does not match the official release")
+    kind = resource.get("archive")
+    if not kind:
+        yield None, data
+        return
+    wanted = normalized_name(model.name)
+    def priority(name):
+        return normalized_name(Path(name).stem) != wanted, name
+    if kind == "zip":
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            members = [m for m in archive.infolist() if not m.is_dir() and Path(m.filename).suffix.lower() in (".ttf", ".otf")]
+            for member in sorted(members, key=lambda m: priority(m.filename)):
+                if member.file_size > 32 * 1024 * 1024:
+                    raise PDFWorkError("Font archive member exceeds 32 MiB")
+                yield member.filename, archive.read(member)
+    elif kind == "tar":
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
+            members = [m for m in archive.getmembers() if m.isfile() and Path(m.name).suffix.lower() in (".ttf", ".otf")]
+            for member in sorted(members, key=lambda m: priority(m.name)):
+                if member.size > 32 * 1024 * 1024:
+                    raise PDFWorkError("Font archive member exceeds 32 MiB")
+                with archive.extractfile(member) as stream:
+                    yield member.name, stream.read()
+    else:
+        raise PDFWorkError(f"Unsupported font archive format: {kind}")
+
+
+def instantiate_candidate(candidate, model):
+    if "fvar" not in candidate:
+        return {}
+    weight, italic = font_style(model)
+    values = {"wght": weight, "ital": italic}
+    if model.tt:
+        if "post" in model.tt:
+            values["slnt"] = float(model.tt["post"].italicAngle)
+        if "OS/2" in model.tt:
+            widths = {1: 50, 2: 62.5, 3: 75, 4: 87.5, 5: 100, 6: 112.5, 7: 125, 8: 150, 9: 200}
+            values["wdth"] = widths.get(model.tt["OS/2"].usWidthClass, 100)
+    axes = {axis.axisTag: max(axis.minValue, min(axis.maxValue, values.get(axis.axisTag, axis.defaultValue)))
+            for axis in candidate["fvar"].axes}
+    instantiateVariableFont(candidate, axes, inplace=True)
+    return axes
+
+
+def resolve_online_font(folder, font_id, model, family, text, attempts):
+    cache = folder / "fonts/downloads"
+    wanted = normalized_name(model.name)
+    family_key = normalized_name(family.split(":", 1)[0])
+    for source, resources in online_font_sources(model, family, text):
+        try:
+            for resource in resources:
+                provenance = {"download_source": source, "download_url": resource["url"]}
+                try:
+                    data = download(resource["url"]).content
+                    matched = False
+                    for member, payload in font_payloads(data, resource, model):
+                        detail = {**provenance, **({"archive_member": member} if member else {})}
+                        try:
+                            with TTFont(io.BytesIO(payload)) as candidate:
+                                if member and not {wanted, family_key}.intersection(names(candidate)):
+                                    continue
+                                matched = True
+                                axes = instantiate_candidate(candidate, model)
+                                if axes:
+                                    detail["variation_axes"] = axes
+                                cmap = candidate.getBestCmap() or {}
+                                missing = sorted({c for c in text if ord(c) not in cmap})
+                                if missing:
+                                    raise PDFWorkError(f"Downloaded font does not contain requested characters: {''.join(missing)!r}")
+                                candidate.flavor = None
+                                stream = io.BytesIO(); candidate.save(stream)
+                            font_data = stream.getvalue()
+                            cache.mkdir(parents=True, exist_ok=True)
+                            path = cache / (digest(font_data) + ".otf"); path.write_bytes(font_data)
+                            result = bind_font(folder, font_id, path, provenance=detail)
+                            return {"resolved": True, "method": source, **result}
+                        except Exception as exc:
+                            attempts.append({"source": source, "url": resource["url"],
+                                             **({"archive_member": member} if member else {}), "error": str(exc)[:2000]})
+                    if not matched:
+                        raise PDFWorkError("Font package contains no matching family or PostScript name")
+                except Exception as exc:
+                    attempts.append({"source": source, "url": resource["url"], "error": str(exc)[:2000]})
+        except Exception as exc:
+            attempts.append({"source": source, "error": str(exc)[:2000]})
+    return None
+
+
 def resolve_font(folder, font_id, text="", online=False, family=None, extra=()):
     folder = Path(folder)
     pdf, model = load_project_model(folder, font_id)
@@ -615,32 +811,9 @@ def resolve_font(folder, font_id, text="", online=False, family=None, extra=()):
                     attempts.append({"path": str(path), "error": str(exc)[:2000]})
         if online:
             family = family or google_family(model)
-            weight, italic = 400, 0
-            if model.tt and "OS/2" in model.tt:
-                weight = int(model.tt["OS/2"].usWeightClass)
-                italic = int(bool(model.tt["OS/2"].fsSelection & 1))
-            chars = "".join(sorted(set(text + "".join(t for t in model.inverse if len(t) == 1 and t.isprintable()))))
-            # text= requests only characters needed for validation and this edit.
-            selector = family if ":" in family else f"{family}:ital,wght@{italic},{weight}"
-            url = "https://fonts.googleapis.com/css2?" + urlencode({"family": selector, "text": chars})
-            response = download(url)
-            urls = list(dict.fromkeys(re.findall(r"url\((https://fonts\.gstatic\.com/[^)]+)\)", response.text)))
-            if not urls:
-                raise PDFWorkError("Google Fonts returned no font resources")
-            cache = folder / "fonts/downloads"; cache.mkdir(parents=True, exist_ok=True)
-            for url in urls:
-                response = download(url)
-                path = cache / (digest(response.content) + ".woff2"); path.write_bytes(response.content)
-                try:
-                    candidate = read_font(path)
-                    if any(ord(c) not in (candidate.getBestCmap() or {}) for c in text):
-                        raise PDFWorkError("Downloaded subset does not contain requested characters")
-                    candidate.close()
-                    result = bind_font(folder, font_id, path)
-                    result["download_url"] = url
-                    return {"resolved": True, "method": "google-fonts", **result}
-                except Exception as exc:
-                    attempts.append({"url": url, "error": str(exc)[:2000]})
+            result = resolve_online_font(folder, font_id, model, family, text, attempts)
+            if result:
+                return result
         raise PDFWorkError(json.dumps({"resolved": False, "font": model.name, "attempts": attempts,
                                       "hint": "Provide an exact font with fonts bind, or use --online --family NAME"}, ensure_ascii=False))
     finally:

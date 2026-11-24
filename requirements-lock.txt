@@ -1,8 +1,9 @@
-# Tested dependency versions; install pdfwork itself with pip install -e .
+# Tested on macOS arm64 / Python 3.14.4 (runtime and test dependencies).
+# Reproduce: .venv/bin/python -m pip install -c requirements-lock.txt -e '.[test]'
+# Refresh: .venv/bin/python -m pip freeze --exclude-editable
 brotli==1.2.1
 certifi==2026.11.20
-charset-normalizer==3.5.2
-colorama==0.4.6
+charset-normalizer==3.5.3
 flatbuffers==25.12.19
 fonttools==4.68.0
 idna==3.20
@@ -13,7 +14,7 @@ numpy==2.5.5
 onnxruntime==1.32.0
 packaging==26.3
 pikepdf==10.18.2
-pillow==13.0.0
+pillow==12.3.0
 pluggy==1.7.0
 protobuf==7.36.2
 psutil==7.2.2
@@ -23,8 +24,10 @@ pymupdf4llm==2.1
 pymupdf_layout==2.1
 pytest==9.2.0
 PyYAML==6.0.4
+qrcode==8.2
 reportlab==5.1.0
 requests==2.34.2
 tabulate==0.10.0
 urllib3==2.8.0
 zopfli==0.4.3
+zxing-cpp==3.1.1

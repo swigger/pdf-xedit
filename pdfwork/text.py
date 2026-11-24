@@ -11,6 +11,9 @@ from .common import PDFWorkError, digest
 
 
 IDENTITY = [1., 0., 0., 1., 0., 0.]
+# PDF user-space points: 0.25 pt is half a pixel at 144 dpi. This bounds
+# baseline flattening and the automatic spacing fit, not the source rendering.
+LINE_TOLERANCE_PT = .25
 
 
 def multiply(a, b):
@@ -39,25 +42,29 @@ def initial_state(ctm=None):
     return {"ctm": ctm or IDENTITY[:], "tm": IDENTITY[:], "lm": IDENTITY[:],
             "font": None, "font_obj": None, "fs": 0., "tc": 0., "tw": 0., "h": 1.,
             "leading": 0., "rise": 0., "tr": 0, "paint": {}, "scope": 0, "bt": 0,
-            "actualtext": False}
+            "actualtext": False, "clip": 0}
 
 
 def scan_container(instructions, resources, fonts, initial=None):
     state = copy.copy(initial) if initial else initial_state()
     state["paint"] = dict(state["paint"])
     stack, marks, runs, children = [], [], [], []
-    serial = 0
+    serial = max(state["scope"], state["bt"])
     for index, instruction in enumerate(instructions):
         if isinstance(instruction, pikepdf.ContentStreamInlineImage):
             serial += 1; state["scope"] = serial; continue
         values, operator = instruction.operands, str(instruction.operator)
         if operator == "q":
-            stack.append({k: copy.copy(v) for k, v in state.items() if k not in ("tm", "lm")})
-            serial += 1; state["scope"] = serial
+            # Saving/restoring graphics state alone is not a visual boundary.
+            # Do not restore the drawing barrier: intervening paint stays on
+            # the page even after Q, so text cannot move ahead of that paint.
+            stack.append({k: copy.copy(v) for k, v in state.items() if k not in ("tm", "lm", "scope")})
         elif operator == "Q":
             if stack:
+                clip = state["clip"]
                 state.update(stack.pop())
-            serial += 1; state["scope"] = serial
+                if state["clip"] != clip:
+                    serial += 1; state["scope"] = serial
         elif operator == "cm":
             state["ctm"] = multiply(state["ctm"], list(map(float, values)))
         elif operator == "BT":
@@ -96,7 +103,9 @@ def scan_container(instructions, resources, fonts, initial=None):
             state["paint"][operator] = str(values)
         elif operator in ("g", "G", "rg", "RG", "k", "K", "cs", "CS", "sc", "SC", "scn", "SCN", "w", "J", "j", "M", "d"):
             state["paint"][operator] = str(values)
-        elif operator in ("W", "W*", "f", "f*", "S", "s", "B", "B*", "b", "b*"):
+        elif operator in ("W", "W*"):
+            serial += 1; state["scope"] = state["clip"] = serial
+        elif operator in ("f", "F", "f*", "S", "s", "B", "B*", "b", "b*", "sh"):
             serial += 1; state["scope"] = serial
         elif operator == "Do":
             target = resources.get("/XObject", {}).get(str(values[0]))
@@ -167,13 +176,47 @@ def group_runs(runs):
             sx = prev["matrix"][0]
             gap = b["position"][0] - (a["position"][0] + a["advance"] * sx)
             display_size = abs(prev["state"]["fs"] * prev["matrix"][3])
+            baseline = groups[-1][0]["glyphs"][0]["position"][1]
             same_line = (not run["read_only"] and not prev["read_only"] and style_key(prev) == style_key(run)
-                         and abs(a["position"][1] - b["position"][1]) < .03
-                         and -.1 <= gap <= max(1., display_size * 1.25))
+                         # Compare with the first baseline, not the previous
+                         # character, to prevent a chain drifting into another row.
+                         and max(abs(g["position"][1] - baseline) for g in run["glyphs"]) <= LINE_TOLERANCE_PT
+                         and b["position"][0] > a["position"][0]
+                         # Negative gaps are normal kerning / independently
+                         # rounded glyph advances, not necessarily overprinting.
+                         and -max(.5, display_size * .15) <= gap <= max(1., display_size * .6))
             if same_line:
                 groups[-1].append(run); continue
         groups.append([run])
     return groups
+
+
+def fit_spacing(glyphs, offsets, sx):
+    """Fit automatic spacing without accumulating glyph-dependent rounding.
+
+    Browser/print drivers often position every glyph separately on a grid.
+    A single tracking value cannot describe the resulting per-glyph advances.
+    Learn corrections from observed adjacent origins only when replaying them
+    fits every origin to within the subpixel budget. New glyphs fall back to
+    the original least-squares tracking estimate.
+    """
+    natural = np.r_[0., np.cumsum([g["advance"] for g in glyphs[:-1]])]
+    indices = np.arange(len(glyphs), dtype=float)
+    observed = np.asarray(offsets) - offsets[0]
+    tracking = float(np.dot(indices, observed - natural) / np.dot(indices, indices)) if len(glyphs) > 1 else 0.
+    residual = (observed - natural - tracking * indices) * sx
+    corrections = {}
+    samples = defaultdict(list)
+    for i, glyph in enumerate(glyphs[:-1]):
+        samples[glyph["code"]].append(offsets[i+1] - offsets[i] - glyph["advance"])
+    candidate = {code: float(np.median(values)) for code, values in samples.items()}
+    advances = [g["advance"] + candidate[g["code"]] for g in glyphs[:-1]]
+    fitted = (observed - np.r_[0., np.cumsum(advances)]) * sx
+    if (candidate and all(value > 0 for value in advances)
+            and max(abs(fitted)) <= LINE_TOLERANCE_PT
+            and np.mean(fitted ** 2) + 1e-12 < np.mean(residual ** 2)):
+        corrections, residual = candidate, fitted
+    return tracking, corrections, residual
 
 
 def describe_line(group, identifier, number, container, content_hash):
@@ -183,14 +226,9 @@ def describe_line(group, identifier, number, container, content_hash):
     sx = matrix[0] or 1.
     origin = point(matrix, 0, state["rise"])
     offsets = [(g["position"][0] - origin[0]) / sx for g in glyphs]
-    cumulative, natural = 0., []
-    for g in glyphs:
-        natural.append(cumulative); cumulative += g["advance"]
-    indices = np.arange(len(glyphs), dtype=float)
-    observed = np.asarray(offsets) - np.asarray(natural)
-    # Least-squares tracking correction with the first glyph held at its exact origin.
-    tracking = float(np.dot(indices, observed - offsets[0]) / np.dot(indices, indices)) if len(glyphs) > 1 else 0.
-    residual = observed - offsets[0] - tracking * indices
+    tracking, corrections, residual_x = fit_spacing(glyphs, offsets, sx)
+    residual_y = np.array([g["position"][1] - glyphs[0]["position"][1] for g in glyphs])
+    residual = np.hypot(residual_x, residual_y)
     width = (offsets[-1] - offsets[0] + glyphs[-1]["width"] * state["fs"] * state["h"] / 1000) * sx
     size = state["fs"] * math.hypot(matrix[2], matrix[3])
     text = "".join(r["text"] for r in group)
@@ -199,12 +237,13 @@ def describe_line(group, identifier, number, container, content_hash):
                 "tracking": "auto", "offset_x": 0., "offset_y": 0.}
     editable = {"id": identifier, **settings, "font": first["font"], "font_size": round(size, 6),
                 "origin": [round(x, 6) for x in glyphs[0]["position"]],
-                "fit_rms_pt": round(float(np.sqrt(np.mean(residual ** 2))) * abs(sx), 6)}
+                "fit_rms_pt": round(float(np.sqrt(np.mean(residual ** 2))), 6),
+                "fit_max_pt": round(float(max(residual)), 6)}
     if first["read_only"]:
         editable["read_only"] = first["read_only"]
     internal = {"id": identifier, "page": number, "container": container, "hash": content_hash,
                 "original": settings, "runs": group, "offsets": offsets,
-                "tracking": tracking, "read_only": first["read_only"]}
+                "tracking": tracking, "advance_corrections": corrections, "read_only": first["read_only"]}
     return editable, internal
 
 
@@ -272,18 +311,22 @@ def rewrite_line(pdf, resources, internal, edit, registry, report):
     tracking = internal["tracking"] if settings["tracking"] == "auto" else float(settings["tracking"]) / sx
     start = internal["offsets"][0]
     positions, natural_width, scale = [], 0., 1.
-    if settings["mode"] == "slots":
+    preserve_positions = (text == internal["original"]["text"] and settings["tracking"] == "auto"
+                          and len(tokens) == len(internal["offsets"]))
+    if settings["mode"] == "slots" or preserve_positions:
         if len(tokens) != len(internal["offsets"]):
             raise PDFWorkError("slots mode requires the same glyph count; use natural mode for longer text")
         positions = list(internal["offsets"])
         if tokens:
             natural_width = positions[-1] - start + tokens[-1][0].width(tokens[-1][2])*state["fs"]*state["h"]/1000
     else:
+        corrections = internal.get("advance_corrections", {}) if settings["tracking"] == "auto" else {}
         for m, t, code in tokens:
             positions.append(start + natural_width)
-            natural_width += (m.width(code)*state["fs"]/1000 + state["tc"] + (state["tw"] if t == " " else 0))*state["h"] + tracking
+            spacing = corrections.get(code.hex(), tracking) if m is model else tracking
+            natural_width += (m.width(code)*state["fs"]/1000 + state["tc"] + (state["tw"] if code == b" " else 0))*state["h"] + spacing
         if tokens:
-            natural_width -= state["tc"]*state["h"] + tracking + (state["tw"]*state["h"] if tokens[-1][1] == " " else 0)
+            natural_width -= state["tc"]*state["h"] + spacing + (state["tw"]*state["h"] if tokens[-1][2] == b" " else 0)
     if natural_width * sx > width + .02:
         if settings["overflow"] == "error" or settings["mode"] == "slots":
             raise PDFWorkError(f"{internal['id']}: text needs {natural_width*sx:.3f} pt, box is {width:.3f} pt; widen it or choose overflow=shrink")

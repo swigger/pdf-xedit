@@ -7,7 +7,16 @@ name = "pdfwork"
 version = "0.1.0"
 description = "Reversible PDF projects, embedded-font text editing and verified font expansion"
 requires-python = ">=3.11"
-dependencies = ["pikepdf>=10.18.2,<11", "PyMuPDF>=1.26,<3", "fonttools[woff]>=4.60", "Pillow>=10", "numpy>=1.26", "requests>=2.32"]
+dependencies = [
+    "pikepdf>=10.18.2,<11",
+    "PyMuPDF>=1.26,<3",
+    "fonttools[woff]>=4.60",
+    "Pillow>=11,<13",
+    "numpy>=1.26",
+    "requests>=2.32",
+    "qrcode>=8,<9",
+    "zxing-cpp>=2.3,<4",
+]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "reportlab>=4"]
@@ -20,5 +29,4 @@ include = ["pdfwork*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["online: live Google Fonts round trip (requires internet)"]
-
+markers = ["online: live font source round trip (requires internet)"]

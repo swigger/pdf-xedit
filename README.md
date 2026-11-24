@@ -4,17 +4,51 @@
 
 ## 立即使用
 
-工作目录：`D:\tmp\f`。已安装本地 `.venv`。PowerShell 中运行：
+macOS / Linux 需要 Python 3.11 或更新版本。在仓库目录中运行：
 
-```powershell
-Set-Location D:\tmp\f
-.\pdfwork.ps1 decompile a.pdf my-project
-.\pdfwork.ps1 list my-project --page 1
-.\pdfwork.ps1 edit my-project p001-l0004 --text '2026年11月8日'
-.\pdfwork.ps1 compile my-project edited.pdf
+```bash
+./setup.sh
+./pdfwork.sh decompile a.pdf my-project
+./pdfwork.sh list my-project --page 1
+./pdfwork.sh edit my-project p001-l0004 --text '2026年11月8日'
+./pdfwork.sh compile my-project edited.pdf
 ```
 
-也可以直接用编辑器修改 `my-project/pages/001.json` 中的 `text`。项目目录必须为空；输出另存为新 PDF。编译失败不会覆盖已有输出。新电脑先运行 `setup.ps1`，需要 Python 3.11 或更新版本。`pdfwork.ps1` 可在其他工作目录调用，输入输出路径相对当前目录。
+`setup.sh` 使用 `python3` 在仓库内创建 `.venv`，安装 PDF、二维码、图片转换及测试依赖；可以重复运行以更新安装。创建时也可用 `PYTHON=/path/to/python3 ./setup.sh` 指定解释器。macOS 缺少合适版本时可先用 Homebrew 安装：`brew install python`。从 Windows 复制来的 `.venv` 不能复用，应先移走，再重新初始化。
+
+`pdfwork.sh` 无需激活虚拟环境，可用绝对路径从其他工作目录调用；输入输出路径相对调用时的当前目录。也可以直接用编辑器修改 `my-project/pages/001.json` 中的 `text`。项目目录必须为空；输出另存为新 PDF。编译失败不会覆盖已有输出。
+
+Windows 仍使用原有入口：
+
+```powershell
+.\setup.ps1
+.\pdfwork.ps1 decompile a.pdf my-project
+.\pdfwork.ps1 list my-project --page 1
+```
+
+下文命令以 macOS / Linux 为例；Windows 把 `./pdfwork.sh` 换成 `.\pdfwork.ps1`，把 `.venv/bin/python` 换成 `.\.venv\Scripts\python.exe`。
+
+## 二维码与 RGB24 图片工具
+
+`qr.py` 和 `binimg.py` 共用项目 `.venv`，依赖统一声明在 `pyproject.toml`：`qr.py` 使用 qrcode、Pillow、zxing-cpp；`binimg.py` 使用 Pillow。
+
+```bash
+# 从 UTF-8 文本生成二维码，再识别回文本
+.venv/bin/python qr.py gen --width 600 -o code.png < input.txt
+.venv/bin/python qr.py scan --no-newline code.png > decoded.txt
+
+# 无文件头的 RGB24 BIN 与 PNG 无损互转；非正方形需要指定尺寸
+.venv/bin/python binimg.py bin2img input.bin output.png --width 600
+.venv/bin/python binimg.py img2bin output.png restored.bin
+```
+
+也可先 `source .venv/bin/activate`，再运行 `./qr.py`、`./binimg.py` 或 `pdfwork`。二维码内容只作为文本处理；RGB24 转换不支持保留透明像素。
+
+`pyproject.toml` 是直接依赖的维护入口；`requirements-lock.txt` 是 macOS 验证环境的依赖版本快照，包含测试依赖及 PyMuPDF 等引入的间接依赖。默认初始化按 `pyproject.toml` 解析兼容版本；需要复现快照时，在初始化后执行：
+
+```bash
+.venv/bin/python -m pip install -c requirements-lock.txt -e '.[test]'
+```
 
 ## UTF-8 输入输出与导出 JSON
 
@@ -22,45 +56,45 @@ Set-Location D:\tmp\f
 
 **保存文字结果请使用 `-o FILE` 或 `--output FILE`，由 Python 直接写文件。** Windows PowerShell 5.1 的 `>`/`Out-File` 默认会把输出重新编码成 UTF-16 LE；即使 Python 输出 UTF-8，外层重定向仍可能改变最终编码。PowerShell 启动脚本会在调用期间正确传递 UTF-8，并在结束后恢复原编码设置。
 
-```powershell
-.\pdfwork.ps1 list D:\tmp\f\b-work\BBB -o b1.json
-.\pdfwork.ps1 list my-project --page 1 --output page1.json
-.\pdfwork.ps1 fonts list my-project -o fonts-list.json
-.\pdfwork.ps1 edit my-project p001-l0004 --text '2026年11月8日' -o edit-result.json
-.\pdfwork.ps1 compile my-project edited.pdf -o build-result.json
+```bash
+./pdfwork.sh list my-project -o b1.json
+./pdfwork.sh list my-project --page 1 --output page1.json
+./pdfwork.sh fonts list my-project -o fonts-list.json
+./pdfwork.sh edit my-project p001-l0004 --text '2026年11月8日' -o edit-result.json
+./pdfwork.sh compile my-project edited.pdf -o build-result.json
 ```
 
 所有产生 JSON 结果的子命令都支持该参数。指定 `-o` 后，结果只写入文件，错误仍写入 stderr；不指定时结果照常写入 stdout。`compile`、`render` 的 PDF/图像输出仍由原来的位置参数指定，`-o` 用于另存 JSON 摘要，`compare --report` 仍是完整比较报告。
 
-主程本身就是 Python，PowerShell 只负责启动。也可以直接运行：
+主程本身就是 Python，shell 脚本只负责启动。也可以直接运行：
 
-```powershell
-.\.venv\Scripts\python.exe -X utf8 -m pdfwork list D:\tmp\f\b-work\BBB -o b1.json
+```bash
+.venv/bin/python -X utf8 -m pdfwork list my-project -o b1.json
 ```
 
 ## 批量编辑 list 导出的 JSON
 
 可以直接修改 `list` 导出的数组，再用 `batchedit` 导回工程：
 
-```powershell
-.\pdfwork.ps1 list D:\tmp\f\b-work\BBB -o b1.json
+```bash
+./pdfwork.sh list my-project -o b1.json
 # 用编辑器修改 b1.json 中的 text、width、align 等可编辑字段，并以 UTF-8 保存。
-.\pdfwork.ps1 batchedit D:\tmp\f\b-work\BBB b1.json
-.\pdfwork.ps1 compile D:\tmp\f\b-work\BBB b1-edited.pdf
+./pdfwork.sh batchedit my-project b1.json
+./pdfwork.sh compile my-project b1-edited.pdf
 ```
 
 可选的预览和报告：
 
-```powershell
-.\pdfwork.ps1 batchedit D:\tmp\f\b-work\BBB b1.json --dry-run
-.\pdfwork.ps1 batchedit D:\tmp\f\b-work\BBB b1.json -o batch-result.json
+```bash
+./pdfwork.sh batchedit my-project b1.json --dry-run
+./pdfwork.sh batchedit my-project b1.json -o batch-result.json
 ```
 
 导入以当前工程为基准，**按 `id` 匹配，顺序无关，只写入实际有变化的页面文件**。同一份输入重复导入时，第二次的 `changed` 为 0，页面文件不会重写。报告列出提交数量、修改数量、未变化数量、修改页数，以及逐字段的修改前后值。
 
 - 支持完整列表，也支持 `list --page`、`list --contains` 的筛选结果。输入中没有列出的记录保持不变，不会隐式删除。
 - 可修改字段与单项 `edit` 相同：`text`、`mode`、`width`、`align`、`overflow`、`min_scale`、`tracking`、`offset_x`、`offset_y`。
-- `id` 用于定位；`page`、`font`、`font_size`、`origin`、`fit_rms_pt`、`read_only` 等说明字段应保持不变。修改只读字段或增加未知字段会报错，避免悄悄忽略操作。
+- `id` 用于定位；`page`、`font`、`font_size`、`origin`、`fit_rms_pt`、`fit_max_pt`、`read_only` 等说明字段应保持不变。修改只读字段或增加未知字段会报错，避免悄悄忽略操作。
 - 也支持精简记录，例如 `[{"id":"p001-l0003","text":"项目总结"}]`。记录中省略的字段保持原值。删除文字时把 `text` 设为空字符串。
 - 重复 ID、未知 ID、页码不匹配、只读文字被修改和不合法的字段值，都会在写入任何页面之前拒绝整批操作。UTF-8 输入可带 BOM，结果文件为无 BOM UTF-8。
 - 校验完成后先准备所有新页面文件，再逐个替换；普通写入错误会回滚已修改页面。如果回滚也遇到文件锁等错误，会保留原文件备份并报告恢复路径。此机制不承诺在进程被强杀、断电或其他程序同时写文件时实现数据库级事务。
@@ -102,55 +136,71 @@ Set-Location D:\tmp\f
 }
 ```
 
-字段省略时继承原设置。其余 `font`、`font_size`、`origin`、`fit_rms_pt` 为说明字段，不是修改字体/字号的接口。
+字段省略时继承原设置。其余 `font`、`font_size`、`origin`、`fit_rms_pt`、`fit_max_pt` 为说明字段，不是修改字体/字号的接口。
 
 - `natural`：按每个字形的实际字宽重新排布，支持增加和删除文字，适合数字变宽和变长的修改。原来的基线和起点不变；字距通过原字形位置做最小二乘拟合。
 - `slots`：每个新字形沿用对应旧字形的位置，必须字形数量相同。适合逐字替换；如果新字更宽，可能占满相邻槽位，通常优先用 natural。
 - `width`：文本框宽度，单位为 PDF 用户空间的点；常见 PDF 中 72 点等于一英寸。
 - `align`：left / center / right，按文本框左右边界对齐。
 - `overflow`：error 表示放不下就报错；shrink 表示保持单行并等比缩小，低于 min_scale 则报错。不会偷偷换字体或跨行排版。
-- `tracking`：auto 使用拟合值；数字表示额外字距，单位为点。
+- `tracking`：auto 使用原始字形位置拟合的间距，包括打印驱动逐字定位产生的字形间距修正；数字表示额外字距，单位为点，并覆盖自动间距修正。
 - `offset_x/offset_y`：相对原起点的平移；通常 x 向右、y 向上。坐标在页面旋转前的 PDF 用户空间。
 - 删除文字时设 `text` 为 `""`；不要删除整个条目。ID 必须保持稳定。
 
-不同字体、字号、颜色或绘制状态的内容保留为独立文字框。相同样式、相同基线、距离合理的相邻绘制片段可以合并；不会把相邻表格列强行合成一行。
+只恢复单行文本框，多行段落仍逐行分开。相同字体、字号、颜色和变换的相邻绘制片段，可以跨 `BT/ET` 和不改变实际效果的 `q/Q` 合并。允许正常紧排造成的少量字宽重叠；基线相对首字最多偏离 0.25 pt，不通过连续小偏移串联到另一行。明显的列间距、重叠重复文字、实际绘图、裁剪和样式变化仍形成边界。
+
+逐字定位的 PDF 可能对不同字形分别取整，单个统一字距会在长句中累积误差。`auto` 会从相邻字形的实际位置学习字形间距修正，仅在水平最大拟合误差不超过 0.25 pt 且优于统一字距时采用；未出现过的字形使用原来的统一字距估计。`fit_rms_pt` / `fit_max_pt` 分别报告自动拟合相对原字形起点的均方根 / 最大距离，单位为 pt（0.25 pt 在 144 DPI 下为半个像素）。这不是对任意新文字排版误差的保证。
+
+未编辑的文字仍保留原始 PDF 指令，不因合并而重排。文字不变且 `tracking=auto` 时，位置、宽度、对齐等编辑保留原始水平字形位置，再应用平移、对齐或缩小。源字体把空白字形映射成制表符时，编辑视图使用普通空格，编码仍复用原字形。
+
+识别规则更新后需重新 `decompile` 到新工程，并重新 `list` 导出 JSON。合并会改变文本框 ID，旧工程的批量编辑 JSON 不应直接套用到新工程；已有工程仍可按原来的 `layout.json` 编译。
 
 ## 复用、寻找和校验字体
 
-```powershell
-.\pdfwork.ps1 fonts list my-project
+```bash
+./pdfwork.sh fonts list my-project
 
-# 自动寻找 Windows / 用户字体目录，按名称筛选，再逐字形验证
-.\pdfwork.ps1 fonts resolve my-project f5_0 --text '项目总结与展望'
+# 自动寻找当前系统 / 用户字体目录，按名称筛选，再逐字形验证
+./pdfwork.sh fonts resolve my-project f5_0 --text '项目总结与展望'
 
 # 指定候选字体，先验证再绑定；TTC 可指定 --index
-.\pdfwork.ps1 fonts check my-project f5_0 C:\Windows\Fonts\simkai.ttf
-.\pdfwork.ps1 fonts bind  my-project f5_0 C:\Windows\Fonts\simkai.ttf
+./pdfwork.sh fonts check my-project f5_0 /path/to/matching-font.ttf
+./pdfwork.sh fonts bind  my-project f5_0 /path/to/matching-font.ttf
 
-# 本地没有时，自动从嵌入字体的家族、字重、斜体信息查询 Google Fonts
-.\pdfwork.ps1 fonts resolve my-project FONT_ID --text 'NEW TEXT' --online
+# 本地没有时，根据嵌入字体的家族、字重、斜体信息查询多个线上源
+./pdfwork.sh fonts resolve my-project FONT_ID --text 'NEW TEXT' --online
 
 # 也可纠正不规范的家族名称，或增加本地搜索目录
-.\pdfwork.ps1 fonts resolve my-project FONT_ID --text 'NEW TEXT' --online --family 'ABeeZee'
-.\pdfwork.ps1 fonts resolve my-project FONT_ID --text 'NEW TEXT' --font-dir D:\fonts
+./pdfwork.sh fonts resolve my-project FONT_ID --text 'NEW TEXT' --online --family 'ABeeZee'
+./pdfwork.sh fonts resolve my-project FONT_ID --text 'NEW TEXT' --font-dir "$HOME/Library/Fonts"
 ```
 
 本来存在的数字、字母或汉字直接复用嵌入子集，不要求安装字体。缺字时编译会给出字体 ID 和缺少的字符；不做替代字体降级。绑定成功后，原子集已有字符仍使用原字形，仅新增字形进入新的嵌入子集；复制和搜索仍有 Unicode 映射。
 
 验证比较所有可对应的、非空白嵌入字形的归一化轮廓与水平字宽，至少需要三个有轮廓字形。轮廓 RMS 容差为 0.004 em，最大局部距离为 0.016 em，字宽容差为 0.004 em；另检查带方向的轮廓面积（容差 0.004 em²），防止边界相同但孔洞被填实的字形误通过。不同名称但相同外形的手动候选也可验证；**仅仅同名绝不构成通过条件**。编译重新检查绑定文件 SHA-256，并再次校验实际源字体。
 
-Google Fonts 不是所有商业字体的镜像。找不到、下载不全或轮廓不匹配时会失败；可手动提供对应字体。`--online` 会向 Google 发送字体家族以及用于验证和补字的字符集合。下载的字体通常只含本次字符集合；下次补更多字时可能需要再次 resolve。
+所有采样点完全重合的退化轮廓不参与边界距离比较，也不计入有轮廓字形数量；例如完整 DejaVu Sans 的 `u` 保留了 PDF 子集可能省略的单点轮廓。这个判断不使用面积或大小阈值，微小的可见标记、总有向面积为零但含真实线段的轮廓仍会被检查。
+
+`--online` 在本地搜索失败后按以下顺序尝试，每个下载或校验失败都会记录原因并继续：
+
+- 对已知家族，优先下载官方发布包：[DejaVu 2.37](https://dejavu-fonts.github.io/Download.html)（Sans、Serif、Mono 等，GitHub / SourceForge 双源）、[Liberation 2.1.5](https://github.com/liberationfonts/liberation-fonts/releases/tag/2.1.5)（Sans、Serif、Mono）、[GNU FreeFont 20120503](https://ftp.gnu.org/gnu/freefont/)（FreeSans、FreeSerif、FreeMono，GNU 主站 / 镜像）。发布包中的字体仍须逐一通过相同校验。
+- Google Fonts CSS API，按家族、字重、斜体及本次字符集合请求字体。
+- [Google Fonts 官方 GitHub 仓库](https://github.com/google/fonts)，查询 `ofl`、`apache`、`ufl` 目录下的完整 TTF/OTF；可在 Google API 无法连接时继续解析。可变字体按原字体的字重、宽度和斜体信息生成静态实例，其余轴用默认值，再校验实际轮廓。
+
+这些来源不覆盖所有字体及历史版本。全部失败时，错误 JSON 的 `attempts` 会列出来源、下载地址和失败原因；仍可用 `fonts bind` 提供精确版本。成功绑定会在 `bindings.json` 保留 `download_source`、`download_url`，以及适用的压缩包成员和可变字体轴值。下载文件保存在工程的 `fonts/downloads/`，不安装到系统。
+
+`--online` 只有访问 Google CSS API 时会发送用于验证和补字的字符集合；其他来源只查询家族或下载发布包。Google CSS 返回的字体可能只含本次字符集合；下次补更多字时可能需要再次 resolve。GitHub API 有匿名访问频率限制，达到限制时也会记录失败原因。
 
 ## 验证与示例
 
-```powershell
-.\pdfwork.ps1 compile my-project rebuilt.pdf
-.\pdfwork.ps1 compare a.pdf rebuilt.pdf --report compare.json --renderer both --dpi 300
-.\pdfwork.ps1 render rebuilt.pdf preview.png --page 1 --dpi 144
-.\.venv\Scripts\python.exe -m pytest -q
+```bash
+./pdfwork.sh compile my-project rebuilt.pdf
+./pdfwork.sh compare a.pdf rebuilt.pdf --report compare.json --renderer both --dpi 300
+./pdfwork.sh render rebuilt.pdf preview.png --page 1 --dpi 144
+.venv/bin/python -m pytest -q -m 'not online'
 ```
 
-`compare` 对所有页面逐 RGB 像素比较，分别使用 MuPDF 和 Poppler；需要 `pdftoppm` 在 PATH 上。本机已有。没有 Poppler 的机器可以指定 `--renderer mupdf`。两个引擎各自比较前后文件，不要求两个不同渲染引擎互相产生相同抗锯齿像素。
+`compare` 默认对所有页面逐 RGB 像素比较，分别使用 MuPDF 和 Poppler；Poppler 需要 `pdftoppm` 在 PATH 上，macOS 可用 `brew install poppler` 安装。没有 Poppler 的机器请指定 `--renderer mupdf`。两个引擎各自比较前后文件，不要求两个不同渲染引擎互相产生相同抗锯齿像素。
 
 `examples/` 中包含：
 
@@ -163,11 +213,11 @@ Google Fonts 不是所有商业字体的镜像。找不到、下载不全或轮�
 
 每个示例都有可继续编辑的工程；`reports/` 保存实际验证数据。重新生成全部验收示例（包含联网验证）可以运行：
 
-```powershell
-.\.venv\Scripts\python.exe build_examples.py --output examples-new
+```bash
+.venv/bin/python build_examples.py --output examples-new
 ```
 
-离线测试：`python -m pytest -q -m 'not online'`。在线测试显式标为 `online`，实际访问 Google CDN，没有用模拟请求代替下载验证。
+离线测试：`.venv/bin/python -m pytest -q -m 'not online'`。完整测试：`.venv/bin/python -m pytest -q`。在线测试显式标为 `online`，实际访问 Google CDN，没有用模拟请求代替下载验证。
 
 ## 支持范围与边界
 

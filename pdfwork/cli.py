@@ -56,7 +56,7 @@ def parser():
         add_json_output(f)
     resolve = fs.add_parser("resolve"); resolve.add_argument("project"); resolve.add_argument("font_id")
     add_json_output(resolve)
-    resolve.add_argument("--text", default=""); resolve.add_argument("--online", action="store_true")
+    resolve.add_argument("--text", default=""); resolve.add_argument("--online", action="store_true", help="Try official font releases, Google Fonts, and its GitHub repository after local search")
     resolve.add_argument("--family"); resolve.add_argument("--font-dir", action="append", default=[])
     cmp = sub.add_parser("compare", help="Render every page and compare exact RGB pixels")
     add_json_output(cmp)
